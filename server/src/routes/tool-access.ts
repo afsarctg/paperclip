@@ -895,6 +895,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
     const resumedConnection = retainedConnectionId
       ? await svc.getConnection(retainedConnectionId, companyId)
       : null;
+    if (resumedConnection) await assertToolConnectionConfigureAccess(req, resumedConnection);
     const effectiveGrantKind = resumedConnection
       ? resumedConnection.credentialPolicy === "per_user"
         ? "user"
@@ -1685,6 +1686,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
           status: connection.status,
           enabled: connection.enabled,
           credentialRefCount: (connection.credentialRefs ?? []).length + connection.credentialSecretRefs.length,
+          ...(req.body.agentInstructions !== undefined ? { agentInstructionsChanged: true, agentInstructionsEnabled: connection.agentInstructions?.enabled ?? false } : {}),
         },
       });
       res.status(201).json(connection);
@@ -2101,6 +2103,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
         details: {
           status: connection.status,
           enabled: connection.enabled,
+          ...(req.body.agentInstructions !== undefined ? { agentInstructionsChanged: true, agentInstructionsEnabled: connection.agentInstructions?.enabled ?? false } : {}),
           credentialRefCount: (connection.credentialRefs ?? []).length + connection.credentialSecretRefs.length,
         },
       });
@@ -2113,6 +2116,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
           details: {
             status: connection.status,
             enabled: connection.enabled,
+          ...(req.body.agentInstructions !== undefined ? { agentInstructionsChanged: true, agentInstructionsEnabled: connection.agentInstructions?.enabled ?? false } : {}),
             lifecycle: change.lifecycle,
             ...change.details,
           },

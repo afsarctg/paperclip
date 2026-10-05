@@ -1,3 +1,5 @@
+import { honchoManagedArguments } from "./honcho-connection.js";
+import { defaultConnectionAgentInstructions } from "@paperclipai/shared";
 import { isInsufficientConnectionScope, INSUFFICIENT_CONNECTION_SCOPE_MESSAGE } from "./connection-permission-errors.js";
 import { ASANA_CONNECTOR_SCOPES, isAsanaConnectorProfileId, type AsanaConnectorProfileId } from "@paperclipai/shared";
 import { BROWSER_USE_TOOLS } from "@paperclipai/shared";
@@ -1198,10 +1200,14 @@ export function projectedConnectionHeaders(
   const headers: Record<string, string> = {};
   if (app) {
     const method = connectionMethodForConnection(app, connection);
-    Object.assign(headers, normalizeConnectionMethodConfig(
-      method,
-      asRecord(connection.config.methodConfig),
-    ).headers);
+    // Non-transport settings do not participate in header projection. In
+    // particular, legacy connections can lack a newly introduced setting.
+    if ([...(method.tenantFields ?? []), ...(method.extensionFields ?? [])].some((field) => field.transport?.location === "header")) {
+      Object.assign(headers, normalizeConnectionMethodConfig(
+        method,
+        asRecord(connection.config.methodConfig),
+      ).headers);
+    }
   }
   if (
     connection.transport === "mcp_remote" &&
@@ -1294,7 +1300,10 @@ export function projectedConnectionToolArguments(
   connection: typeof toolConnections.$inferSelect,
   parameters: unknown,
   toolName: string,
+  inputSchema: Record<string, unknown> = {},
 ): Record<string, unknown> {
+  const managed = honchoManagedArguments(connection, inputSchema);
+  if (managed) parameters = mergeManagedToolArguments(asRecord(parameters), managed);
   assertGoogleChatToolArgumentsSupported(connection, toolName, parameters);
   const sourceTemplateKey =
     typeof connection.config.sourceTemplateKey === "string"
@@ -1315,6 +1324,8 @@ export function projectedConnectionToolInputSchema(
   inputSchema: Record<string, unknown>,
   toolName: string,
 ): Record<string, unknown> {
+  const managed = honchoManagedArguments(connection, inputSchema);
+  if (managed) inputSchema = stripManagedToolArgumentSchema(inputSchema, managed);
   inputSchema = googleChatToolInputSchema(connection, toolName, inputSchema);
   const sourceTemplateKey =
     typeof connection.config.sourceTemplateKey === "string"
@@ -1613,6 +1624,7 @@ function toConnection(row: typeof toolConnections.$inferSelect): ToolConnection 
     credentialPolicy: row.credentialPolicy,
     status: row.status,
     enabled: row.enabled && !retired,
+    agentInstructions: row.agentInstructions ?? null,
     config: row.config ?? {},
     transportConfig: row.transportConfig ?? {},
     credentialRefs: row.credentialRefs ?? [],
@@ -2235,6 +2247,7 @@ function connectionSetupMutationFingerprint(
     transport: row.transport,
     status: row.status,
     enabled: row.enabled,
+    agentInstructions: row.agentInstructions,
     config: row.config,
     transportConfig: row.transportConfig,
     credentialRefs: row.credentialRefs,
@@ -12196,7 +12209,7 @@ export function toolAccessService(
     const normalizedMethodConfig =
       isGoogleSheetsRobotMethod || !method
         ? null
-        : normalizeConnectionMethodConfig(method, input.configValues);
+        : normalizeConnectionMethodConfig(method, input.configValues ?? asRecord(asRecord(retainedConnection?.config).methodConfig));
     const remoteUrlCredential =
       transport === "mcp_remote" && input.link
         ? splitRemoteUrlCredential(input.link)
@@ -12594,6 +12607,10 @@ export function toolAccessService(
             transport,
             status: "draft",
             enabled: false,
+            agentInstructions: input.agentInstructions !== undefined
+              ? input.agentInstructions
+              : retainedConnection ? retainedConnection.agentInstructions
+              : defaultConnectionAgentInstructions(galleryEntry?.agentInstructions),
             config,
             transportConfig: config,
             credentialRefs,
@@ -12627,6 +12644,10 @@ export function toolAccessService(
             transport,
             status: "draft",
             enabled: false,
+            agentInstructions: input.agentInstructions !== undefined
+              ? input.agentInstructions
+              : retainedConnection ? retainedConnection.agentInstructions
+              : defaultConnectionAgentInstructions(galleryEntry?.agentInstructions),
             config,
             transportConfig: config,
             credentialRefs,
@@ -13023,6 +13044,7 @@ export function toolAccessService(
               await tx
                 .update(toolConnections)
                 .set({
+                  agentInstructions: revivedConnectionPrevious.agentInstructions,
                   name: revivedConnectionPrevious.name,
                   transport: revivedConnectionPrevious.transport,
                   status: revivedConnectionPrevious.status,
@@ -13332,7 +13354,7 @@ export function toolAccessService(
       const config = { ...connection.config };
       delete config.mcpPreserveAccess;
       const updated = await db.transaction(async (tx) => {
-        const [row] = await tx.update(toolConnections).set({ config, transportConfig: config, status: "active", enabled: true, updatedAt: new Date() })
+        const [row] = await tx.update(toolConnections).set({ config, transportConfig: config, status: "active", enabled: true, ...(input.agentInstructions !== undefined ? { agentInstructions: input.agentInstructions } : {}), updatedAt: new Date() })
           .where(and(eq(toolConnections.id, connection.id), eq(toolConnections.companyId, companyId))).returning();
         await tx.update(toolApplications).set({ status: "active", updatedAt: new Date() }).where(and(eq(toolApplications.id, connection.applicationId), eq(toolApplications.companyId, companyId)));
         return row;
@@ -13685,7 +13707,7 @@ export function toolAccessService(
       );
       const [updatedConnection] = await tx
         .update(toolConnections)
-        .set({ status: "active", enabled: true, updatedAt: new Date() })
+        .set({ status: "active", enabled: true, ...(input.agentInstructions !== undefined ? { agentInstructions: input.agentInstructions } : {}), updatedAt: new Date() })
         .where(eq(toolConnections.id, connection.id))
         .returning();
       await tx
@@ -17389,6 +17411,9 @@ export function toolAccessService(
             (input.authKind === "oauth" ? "per_user" : "shared"),
           status: input.status ?? "draft",
           enabled: input.enabled ?? false,
+          agentInstructions: input.agentInstructions !== undefined ? input.agentInstructions : defaultConnectionAgentInstructions(
+            typeof config.sourceTemplateKey === "string" ? getConnectableAppDefinition(config.sourceTemplateKey)?.agentInstructions : null,
+          ),
           config,
           transportConfig: isGoogleSheetsConnectionConfig(config)
             ? config
@@ -18261,6 +18286,10 @@ export function toolAccessService(
       const config = normalizeGoogleSheetsConnectionConfig(
         input.config ?? input.transportConfig ?? existing.config,
       );
+      if (input.config?.methodConfig !== undefined && typeof config.sourceTemplateKey === "string") {
+        const app = getConnectableAppDefinition(config.sourceTemplateKey);
+        if (app) normalizeConnectionMethodConfig(connectionMethodForConnection(app, { ...existing, config }), asRecord(config.methodConfig));
+      }
       if (existing.transport === "mcp_remote")
         await assertRemoteConnectionEndpointsAllowed(config);
       if (existing.transport === "local_stdio")
@@ -18283,6 +18312,7 @@ export function toolAccessService(
           name: input.name ?? existing.name,
           status: input.status ?? existing.status,
           enabled: input.enabled ?? existing.enabled,
+          ...(input.agentInstructions !== undefined ? { agentInstructions: input.agentInstructions } : {}),
           config,
           transportConfig: isGoogleSheetsConnectionConfig(config)
             ? config
